@@ -1,0 +1,33 @@
+name: Release to NuGet
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: authfi-ci-dotnet
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify project version matches tag
+        if: github.event_name == 'push'
+        run: |
+          PROJECT_VERSION=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' AuthFI.csproj)
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::project version ($PROJECT_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Pack
+        run: dotnet pack AuthFI.csproj -c Release -o out
+
+      - name: Push to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: dotnet nuget push out/*.nupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
