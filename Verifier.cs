@@ -362,7 +362,7 @@ internal static class B64
         var t = s.Replace('-', '+').Replace('_', '/');
         switch (t.Length % 4) { case 2: t += "=="; break; case 3: t += "="; break; case 1: throw new FormatException(); }
         var bytes = Convert.FromBase64String(t);
-        if (Convert.ToBase64String(bytes).TrimEnd('=') != s.Replace('-', '+').Replace('_', '/')) throw new FormatException();
+        if (Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_') != s) throw new FormatException();
         return bytes;
     }
 }
@@ -482,7 +482,7 @@ internal sealed class VerificationKey
             }
             return new VerificationKey { Kid = kid, Algorithms = allowed, Verify = verify };
         }
-        catch (Exception e) when (e is CryptographicException or FormatException or ArgumentException or JsonException)
+        catch (Exception e) when (e is CryptographicException or FormatException or ArgumentException or JsonException or InvalidOperationException)
         {
             return null;
         }
@@ -501,6 +501,7 @@ internal sealed class KeyStore
 
     private readonly string _issuer;
     private readonly string _scheme;
+    private readonly string _host;
     private readonly HttpClient _http;
     private readonly TimeSpan _lifetime;
     private readonly TimeSpan _unknownKidInterval;
@@ -517,6 +518,7 @@ internal sealed class KeyStore
     {
         _issuer = issuer;
         _scheme = new Uri(issuer).Scheme;
+        _host = new Uri(issuer).Host;
         _http = http ?? new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(10) };
         _lifetime = lifetime;
         _unknownKidInterval = unknownKidInterval;
@@ -545,8 +547,9 @@ internal sealed class KeyStore
         try
         {
             if (Answerable(kid, out key)) return key;
-            Attempt();
+            var before = Attempt();
             try { Apply(await Fetch(sync: false, ct).ConfigureAwait(false)); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { Undo(before); throw; } // the caller left; the issuer did not fail
             catch { Failed(); throw; }
             return Lookup(kid);
         }
@@ -577,7 +580,17 @@ internal sealed class KeyStore
         }
     }
 
-    private void Attempt() { lock (_lock) _attemptedAt = _time.GetUtcNow(); }
+    private DateTimeOffset Attempt()
+    {
+        lock (_lock)
+        {
+            var before = _attemptedAt;
+            _attemptedAt = _time.GetUtcNow();
+            return before;
+        }
+    }
+
+    private void Undo(DateTimeOffset attemptedAt) { lock (_lock) _attemptedAt = attemptedAt; }
 
     private void Failed() { lock (_lock) _lastFailed = true; }
 
@@ -612,8 +625,9 @@ internal sealed class KeyStore
                     throw new AuthFIException("jwks_unavailable", "The discovery document does not belong to this issuer.", 503);
                 jwksUri = ju.GetString()!;
             }
-            if (!Uri.TryCreate(jwksUri, UriKind.Absolute, out var u) || u.Scheme != _scheme || !string.IsNullOrEmpty(u.UserInfo))
-                throw new AuthFIException("jwks_unavailable", "The discovery document's jwks_uri does not use the issuer's scheme.", 503);
+            if (!Uri.TryCreate(jwksUri, UriKind.Absolute, out var u) || u.Scheme != _scheme || !string.IsNullOrEmpty(u.UserInfo)
+                || !string.Equals(u.Host, _host, StringComparison.OrdinalIgnoreCase))
+                throw new AuthFIException("jwks_unavailable", "The discovery document's jwks_uri is not on the issuer's scheme and host.", 503);
 
             var json = await Get(jwksUri, sync, ct).ConfigureAwait(false);
             var byKid = new Dictionary<string, VerificationKey>(StringComparer.Ordinal);
