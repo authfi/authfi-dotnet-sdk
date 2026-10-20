@@ -29,6 +29,9 @@ internal sealed class StubHandler : HttpMessageHandler
         return _answer(r);
     }
 
+    /// <summary>Answers a request directly, for a test handler that wraps this one.</summary>
+    public HttpResponseMessage Respond(HttpRequestMessage request) => Answer(request);
+
     protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken ct) => Answer(request);
 
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
