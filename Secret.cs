@@ -17,6 +17,7 @@ public sealed class Secret : IFormattable
 {
     public const string Redacted = "Secret(****)";
 
+    [DebuggerBrowsable(DebuggerBrowsableState.Never)]
     private readonly string _value;
 
     public Secret(string value)
@@ -31,7 +32,7 @@ public sealed class Secret : IFormattable
 
     public string ToString(string? format, IFormatProvider? formatProvider) => Redacted;
 
-    /// <summary>Constant-time comparison of the two values.</summary>
+    /// <summary>Constant-time comparison of the two values (the length of each is not hidden).</summary>
     public bool ValueEquals(Secret? other)
     {
         if (other is null) return false;

@@ -64,9 +64,13 @@ public sealed class AuthFIVerifier
         _audiences = new HashSet<string>(options.Audiences, StringComparer.Ordinal);
         if (options.Leeway < TimeSpan.Zero || options.Leeway > TimeSpan.FromSeconds(300))
             throw new AuthFIConfigurationException("Leeway must be between 0 and 300 seconds.");
+        if (options.KeyCacheLifetime <= TimeSpan.Zero || options.KeyCacheLifetime > TimeSpan.FromDays(1))
+            throw new AuthFIConfigurationException("KeyCacheLifetime must be between 0 and 24 hours.");
+        if (options.UnknownKidRefetchInterval < TimeSpan.Zero)
+            throw new AuthFIConfigurationException("UnknownKidRefetchInterval must not be negative.");
         _leeway = options.Leeway;
         _tenant = string.IsNullOrEmpty(options.ExpectedTenantId) ? null : options.ExpectedTenantId;
-        _time = options.TimeProvider;
+        _time = options.TimeProvider ?? throw new AuthFIConfigurationException("A TimeProvider is required.");
         _keys = new KeyStore(_issuer, options.HttpClient, options.KeyCacheLifetime, options.UnknownKidRefetchInterval, _time);
     }
 
@@ -79,7 +83,7 @@ public sealed class AuthFIVerifier
 
     public AuthFIClaims Verify(Secret token)
     {
-        var jws = Jws.Parse(token.Reveal());
+        var jws = Jws.Parse(token?.Reveal() ?? "");
         var key = _keys.Find(jws.Kid);
         return Finish(jws, key);
     }
@@ -89,19 +93,25 @@ public sealed class AuthFIVerifier
 
     public async Task<AuthFIClaims> VerifyAsync(Secret token, CancellationToken ct = default)
     {
-        var jws = Jws.Parse(token.Reveal());
+        var jws = Jws.Parse(token?.Reveal() ?? "");
         var key = await _keys.FindAsync(jws.Kid, ct).ConfigureAwait(false);
         return Finish(jws, key);
     }
 
     private AuthFIClaims Finish(Jws jws, VerificationKey? key)
     {
-        if (key is null || !key.Algorithms.Contains(jws.Alg))
-            throw new AuthFIException("token_key_unknown", "The issuer publishes no key for this token's kid and algorithm.", 401);
-        if (!key.Verify(jws.Alg, jws.SigningInput, jws.Signature))
-            throw new AuthFIException("token_signature_invalid", "The signature does not verify.", 401);
         using (jws.Payload)
-            return CheckClaims(jws.Payload.RootElement);
+        {
+            if (key is null || !key.Algorithms.Contains(jws.Alg))
+                throw new AuthFIException("token_key_unknown", "The issuer publishes no key for this token's kid and algorithm.", 401);
+            if (!key.Verify(jws.Alg, jws.SigningInput, jws.Signature))
+                throw new AuthFIException("token_signature_invalid", "The signature does not verify.", 401);
+            try { return CheckClaims(jws.Payload.RootElement); }
+            catch (InvalidOperationException) // a string claim holding an invalid escape cannot be read
+            {
+                throw new AuthFIException("token_claims_invalid", "A claim could not be read.", 401);
+            }
+        }
     }
 
     private AuthFIClaims CheckClaims(JsonElement c)
@@ -225,8 +235,9 @@ public sealed class AuthFIVerifier
     private static string NormaliseIssuer(string issuer)
     {
         if (string.IsNullOrWhiteSpace(issuer) || !Uri.TryCreate(issuer, UriKind.Absolute, out var u)
-            || !string.IsNullOrEmpty(u.Query) || !string.IsNullOrEmpty(u.Fragment))
-            throw new AuthFIConfigurationException("The issuer must be an absolute URL such as https://acme.authfi.io.");
+            || !string.IsNullOrEmpty(u.Query) || !string.IsNullOrEmpty(u.Fragment) || !string.IsNullOrEmpty(u.UserInfo)
+            || u.AbsolutePath != "/")
+            throw new AuthFIConfigurationException("The issuer must be an absolute URL such as https://acme.authfi.io, with no credentials, path or query.");
         if (u.Scheme != Uri.UriSchemeHttps && !(u.Scheme == Uri.UriSchemeHttp && u.IsLoopback))
             throw new AuthFIConfigurationException("The issuer must be an https URL.");
         return issuer.TrimEnd('/');
@@ -244,9 +255,13 @@ public sealed class AuthFIVerifier
         var a = audience.TrimEnd('/');
         if (a == issuer || a.StartsWith(issuer + "/", StringComparison.Ordinal))
             throw new AuthFIConfigurationException("The audience is the issuer or a URL under it, which gateway tokens carry." + fix);
-        if (Uri.TryCreate(audience, UriKind.Absolute, out var au) && Uri.TryCreate(issuer, UriKind.Absolute, out var iu)
-            && string.Equals(au.Host, iu.Host, StringComparison.OrdinalIgnoreCase))
-            throw new AuthFIConfigurationException("The audience is on the issuer's host, which is AuthFI's own." + fix);
+        if (Uri.TryCreate(audience, UriKind.Absolute, out var au))
+        {
+            var host = au.Host.ToLowerInvariant();
+            if (string.Equals(au.Host, new Uri(issuer).Host, StringComparison.OrdinalIgnoreCase)
+                || host == "authfi.io" || host.EndsWith(".authfi.io", StringComparison.Ordinal))
+                throw new AuthFIConfigurationException("The audience is on AuthFI's own domain, which gateway tokens carry." + fix);
+        }
     }
 }
 
@@ -275,10 +290,12 @@ internal sealed class Jws
         JsonDocument headerDoc;
         try
         {
-            headerDoc = JsonDocument.Parse(B64.Decode(parts[0]));
+            var headerBytes = B64.Decode(parts[0]);
+            if (Json.HasDuplicateName(headerBytes)) throw new FormatException();
+            headerDoc = JsonDocument.Parse(headerBytes);
             header = headerDoc.RootElement;
         }
-        catch (Exception e) when (e is FormatException or JsonException or ArgumentException)
+        catch (Exception e) when (e is FormatException or JsonException or ArgumentException or InvalidOperationException)
         {
             throw new AuthFIException("token_malformed", "The header is not base64url JSON.", 401);
         }
@@ -308,9 +325,11 @@ internal sealed class Jws
             try
             {
                 sig = B64.Decode(parts[2]);
-                payload = JsonDocument.Parse(B64.Decode(parts[1]));
+                var payloadBytes = B64.Decode(parts[1]);
+                if (Json.HasDuplicateName(payloadBytes)) throw new FormatException();
+                payload = JsonDocument.Parse(payloadBytes);
             }
-            catch (Exception e) when (e is FormatException or JsonException or ArgumentException)
+            catch (Exception e) when (e is FormatException or JsonException or ArgumentException or InvalidOperationException)
             {
                 throw new AuthFIException("token_malformed", "The token could not be decoded.", 401);
             }
@@ -326,17 +345,54 @@ internal sealed class Jws
         }
     }
 
-    private static string? HeaderString(JsonElement header, string name) =>
-        header.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+    private static string? HeaderString(JsonElement header, string name)
+    {
+        if (!header.TryGetProperty(name, out var v) || v.ValueKind != JsonValueKind.String) return null;
+        try { return v.GetString(); }
+        catch (InvalidOperationException) { throw new AuthFIException("token_malformed", "The header is not base64url JSON.", 401); }
+    }
 }
 
 internal static class B64
 {
+    /// <summary>Decodes unpadded base64url and refuses anything but its canonical spelling, so one token is one string.</summary>
     public static byte[] Decode(string s)
     {
+        if (s.Contains('=')) throw new FormatException();
         var t = s.Replace('-', '+').Replace('_', '/');
         switch (t.Length % 4) { case 2: t += "=="; break; case 3: t += "="; break; case 1: throw new FormatException(); }
-        return Convert.FromBase64String(t);
+        var bytes = Convert.FromBase64String(t);
+        if (Convert.ToBase64String(bytes).TrimEnd('=') != s.Replace('-', '+').Replace('_', '/')) throw new FormatException();
+        return bytes;
+    }
+}
+
+internal static class Json
+{
+    /// <summary>True when an object at the top level repeats a property name; another parser would take the other value.</summary>
+    public static bool HasDuplicateName(byte[] utf8)
+    {
+        var reader = new Utf8JsonReader(utf8);
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var depth = 0;
+        while (reader.Read())
+        {
+            switch (reader.TokenType)
+            {
+                case JsonTokenType.StartObject:
+                case JsonTokenType.StartArray:
+                    depth++;
+                    break;
+                case JsonTokenType.EndObject:
+                case JsonTokenType.EndArray:
+                    depth--;
+                    break;
+                case JsonTokenType.PropertyName when depth == 1:
+                    if (!names.Add(reader.GetString()!)) return true;
+                    break;
+            }
+        }
+        return false;
     }
 }
 
@@ -347,12 +403,21 @@ internal sealed class VerificationKey
     public required HashSet<string> Algorithms { get; init; }
     public required Func<string, byte[], byte[], bool> Verify { get; init; }
 
+    private static int BitLength(byte[] bigEndian)
+    {
+        var i = 0;
+        while (i < bigEndian.Length && bigEndian[i] == 0) i++;
+        return i == bigEndian.Length ? 0 : (bigEndian.Length - i - 1) * 8 + (32 - System.Numerics.BitOperations.LeadingZeroCount((uint)bigEndian[i]));
+    }
+
     /// <summary>Builds the key from a JWK, or null when it is not a usable signature key.</summary>
     public static VerificationKey? FromJwk(JsonElement jwk)
     {
         try
         {
             if (jwk.ValueKind != JsonValueKind.Object) return null;
+            foreach (var member in new[] { "kid", "kty", "use", "alg" })
+                if (jwk.TryGetProperty(member, out var m) && m.ValueKind != JsonValueKind.String) return null; // a present non-string makes the key unusable
             string? S(string n) => jwk.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
             var kid = S("kid");
             var kty = S("kty");
@@ -367,9 +432,10 @@ internal sealed class VerificationKey
             {
                 case "RSA":
                 {
+                    var modulus = B64.Decode(S("n") ?? "");
+                    if (BitLength(modulus) < 2048) return null;
                     var rsa = RSA.Create();
-                    rsa.ImportParameters(new RSAParameters { Modulus = B64.Decode(S("n") ?? ""), Exponent = B64.Decode(S("e") ?? "") });
-                    if (rsa.KeySize < 2048) return null;
+                    rsa.ImportParameters(new RSAParameters { Modulus = modulus, Exponent = B64.Decode(S("e") ?? "") });
                     allowed = new() { "RS256", "PS256" };
                     verify = (alg, data, sig) => rsa.VerifyData(data, sig, HashAlgorithmName.SHA256,
                         alg == "PS256" ? RSASignaturePadding.Pss : RSASignaturePadding.Pkcs1);
@@ -424,26 +490,33 @@ internal sealed class VerificationKey
 }
 
 /// <summary>
-/// The issuer's key set, found through its discovery document. Fetched on first use, again after the lifetime,
-/// and once more (no more often than the interval) when a kid is unknown.
+/// The issuer's key set, found through its discovery document. Fetched on first use and again after the lifetime.
+/// An unknown kid refetches at most once per interval, a failed fetch is not retried for a few seconds, and callers
+/// share one fetch in flight, so neither random kids nor an outage can drive the issuer's key endpoint.
 /// </summary>
 internal sealed class KeyStore
 {
     private const int MaxBytes = 1 << 20;
+    private static readonly TimeSpan FailureBackoff = TimeSpan.FromSeconds(5);
 
     private readonly string _issuer;
+    private readonly string _scheme;
     private readonly HttpClient _http;
     private readonly TimeSpan _lifetime;
     private readonly TimeSpan _unknownKidInterval;
     private readonly TimeProvider _time;
     private readonly object _lock = new();
+    private readonly SemaphoreSlim _gate = new(1, 1);
 
     private Dictionary<string, VerificationKey>? _byKid;
     private DateTimeOffset _fetchedAt;
+    private DateTimeOffset _attemptedAt;
+    private bool _lastFailed;
 
     public KeyStore(string issuer, HttpClient? http, TimeSpan lifetime, TimeSpan unknownKidInterval, TimeProvider time)
     {
         _issuer = issuer;
+        _scheme = new Uri(issuer).Scheme;
         _http = http ?? new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(10) };
         _lifetime = lifetime;
         _unknownKidInterval = unknownKidInterval;
@@ -452,30 +525,61 @@ internal sealed class KeyStore
 
     public VerificationKey? Find(string kid)
     {
-        if (TryCached(kid, out var key)) return key;
-        Apply(Fetch(sync: true, default).GetAwaiter().GetResult());
-        return Lookup(kid);
+        if (Answerable(kid, out var key)) return key;
+        _gate.Wait();
+        try
+        {
+            if (Answerable(kid, out key)) return key; // another caller refreshed while this one waited
+            Attempt();
+            try { Apply(Fetch(sync: true, default).GetAwaiter().GetResult()); }
+            catch { Failed(); throw; }
+            return Lookup(kid);
+        }
+        finally { _gate.Release(); }
     }
 
     public async Task<VerificationKey?> FindAsync(string kid, CancellationToken ct)
     {
-        if (TryCached(kid, out var key)) return key;
-        Apply(await Fetch(sync: false, ct).ConfigureAwait(false));
-        return Lookup(kid);
+        if (Answerable(kid, out var key)) return key;
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (Answerable(kid, out key)) return key;
+            Attempt();
+            try { Apply(await Fetch(sync: false, ct).ConfigureAwait(false)); }
+            catch { Failed(); throw; }
+            return Lookup(kid);
+        }
+        finally { _gate.Release(); }
     }
 
-    private bool TryCached(string kid, out VerificationKey? key)
+    /// <summary>True when the cache answers (a key, or null for a kid not worth a refetch yet); false when a fetch is due. Throws while backing off after a failure.</summary>
+    private bool Answerable(string kid, out VerificationKey? key)
     {
         lock (_lock)
         {
             key = null;
-            if (_byKid is null) return false;
-            var age = _time.GetUtcNow() - _fetchedAt;
-            if (age >= _lifetime) return false;
-            if (_byKid.TryGetValue(kid, out key)) return true;
-            return age < _unknownKidInterval; // unknown kid: answer from the cache unless a refetch is allowed
+            var now = _time.GetUtcNow();
+            var sinceAttempt = now - _attemptedAt;
+            var attemptedRecently = sinceAttempt >= TimeSpan.Zero && sinceAttempt < FailureBackoff;
+            if (_byKid is not null)
+            {
+                var age = now - _fetchedAt; // a clock that stepped back counts as expired
+                if (age >= TimeSpan.Zero && age < _lifetime)
+                {
+                    if (_byKid.TryGetValue(kid, out key)) return true;
+                    return sinceAttempt >= TimeSpan.Zero && sinceAttempt < _unknownKidInterval;
+                }
+            }
+            if (_lastFailed && attemptedRecently)
+                throw new AuthFIException("jwks_unavailable", "The issuer's keys could not be fetched.", 503);
+            return false;
         }
     }
+
+    private void Attempt() { lock (_lock) _attemptedAt = _time.GetUtcNow(); }
+
+    private void Failed() { lock (_lock) _lastFailed = true; }
 
     private VerificationKey? Lookup(string kid)
     {
@@ -488,6 +592,7 @@ internal sealed class KeyStore
         {
             _byKid = keys;
             _fetchedAt = _time.GetUtcNow();
+            _lastFailed = false;
         }
     }
 
@@ -507,9 +612,8 @@ internal sealed class KeyStore
                     throw new AuthFIException("jwks_unavailable", "The discovery document does not belong to this issuer.", 503);
                 jwksUri = ju.GetString()!;
             }
-            if (!Uri.TryCreate(jwksUri, UriKind.Absolute, out var u)
-                || !(u.Scheme == Uri.UriSchemeHttps || (u.Scheme == Uri.UriSchemeHttp && u.IsLoopback)))
-                throw new AuthFIException("jwks_unavailable", "The discovery document's jwks_uri is not an https URL.", 503);
+            if (!Uri.TryCreate(jwksUri, UriKind.Absolute, out var u) || u.Scheme != _scheme || !string.IsNullOrEmpty(u.UserInfo))
+                throw new AuthFIException("jwks_unavailable", "The discovery document's jwks_uri does not use the issuer's scheme.", 503);
 
             var json = await Get(jwksUri, sync, ct).ConfigureAwait(false);
             var byKid = new Dictionary<string, VerificationKey>(StringComparer.Ordinal);
@@ -530,7 +634,9 @@ internal sealed class KeyStore
             return byKid;
         }
         catch (AuthFIException) { throw; }
-        catch (Exception e) when (e is HttpRequestException or JsonException or TaskCanceledException or InvalidOperationException or IOException)
+        catch (Exception e) when (e is HttpRequestException or JsonException or InvalidOperationException or IOException
+                                      or NotSupportedException
+                                  || (e is TaskCanceledException && !ct.IsCancellationRequested))
         {
             throw new AuthFIException("jwks_unavailable", "The issuer's keys could not be fetched.", 503);
         }

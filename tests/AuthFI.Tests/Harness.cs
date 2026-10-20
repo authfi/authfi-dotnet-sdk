@@ -108,6 +108,13 @@ internal sealed class TestKey
         return input + "." + B64u(_sign(Encoding.ASCII.GetBytes(input)));
     }
 
+    /// <summary>Signs header and payload JSON exactly as given, for inputs a JsonObject cannot express (duplicate names, bad escapes).</summary>
+    public string MintRaw(string headerJson, string payloadJson)
+    {
+        var input = B64u(Encoding.UTF8.GetBytes(headerJson)) + "." + B64u(Encoding.UTF8.GetBytes(payloadJson));
+        return input + "." + B64u(_sign(Encoding.ASCII.GetBytes(input)));
+    }
+
     public static string B64u(byte[] b) => Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 }
 
