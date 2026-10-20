@@ -1,9 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
     <PackageId>AuthFI</PackageId>
-    <Version>0.1.0</Version>
-    <Description>AuthFI .NET SDK — JWT validation, RBAC middleware, permission auto-sync</Description>
+    <Version>0.2.0</Version>
+    <Description>AuthFI .NET SDK: strict access-token verification (RS256, PS256, ES256, EdDSA) and RBAC checks</Description>
     <Authors>AuthFI</Authors>
     <PackageProjectUrl>https://authfi.io</PackageProjectUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -12,12 +14,12 @@
   </PropertyGroup>
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <Compile Remove="tests/**" />
   </ItemGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.IdentityModel.JsonWebTokens" Version="8.0.1" />
-    <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="8.0.1" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
   </ItemGroup>
 </Project>
