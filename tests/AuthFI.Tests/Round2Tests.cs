@@ -130,4 +130,44 @@ public class Round2Tests
         Assert.Equal("token_key_unknown", Code(() => v.Verify(key.Mint(editHeader: h => h["alg"] = "ES256"))));
         Assert.Equal("token_key_unknown", Code(() => v.Verify(key.Mint())));
     }
+
+    private sealed class ThrowHandler : HttpMessageHandler
+    {
+        public Exception E = null!;
+        protected override HttpResponseMessage Send(HttpRequestMessage r, CancellationToken ct) => throw E;
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage r, CancellationToken ct) => throw E;
+    }
+
+    [Theory]
+    [InlineData("Argument")]
+    [InlineData("Format")]
+    [InlineData("ObjectDisposed")]
+    public async Task Whatever_the_transport_throws_the_caller_sees_one_refusal(string kind)
+    {
+        Exception e = kind switch { "Argument" => new ArgumentException("x"), "Format" => new FormatException("x"), _ => new ObjectDisposedException("x") };
+        var key = TestKey.Create("EdDSA", "k1");
+        var token = key.Mint();
+        var sync = new TestIssuer(key).Verifier(o => o.HttpClient = new HttpClient(new ThrowHandler { E = e }));
+        Assert.Equal("jwks_unavailable", Code(() => sync.Verify(token)));
+        var async = new TestIssuer(key).Verifier(o => o.HttpClient = new HttpClient(new ThrowHandler { E = e }));
+        Assert.Equal("jwks_unavailable", (await Assert.ThrowsAsync<AuthFIException>(() => async.VerifyAsync(token))).Code);
+    }
+
+    [Theory]
+    [InlineData("https://api.authfi.io./")]
+    [InlineData("https://API.AUTHFI.IO.:443/x")]
+    public void A_trailing_dot_does_not_make_AuthFIs_host_a_different_host(string audience)
+    {
+        var o = new AuthFIVerifierOptions { Issuer = "https://acme.example.com" };
+        o.Audiences.Add(audience);
+        Assert.Throws<AuthFIConfigurationException>(() => new AuthFIVerifier(o));
+    }
+
+    [Fact]
+    public void An_issuer_with_an_empty_userinfo_is_refused_too()
+    {
+        var o = new AuthFIVerifierOptions { Issuer = "https://@acme.authfi.io" };
+        o.Audiences.Add("api_orders");
+        Assert.Throws<AuthFIConfigurationException>(() => new AuthFIVerifier(o));
+    }
 }

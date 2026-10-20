@@ -234,7 +234,7 @@ public sealed class AuthFIVerifier
 
     private static string NormaliseIssuer(string issuer)
     {
-        if (string.IsNullOrWhiteSpace(issuer) || !Uri.TryCreate(issuer, UriKind.Absolute, out var u)
+        if (string.IsNullOrWhiteSpace(issuer) || issuer.Contains('@') || !Uri.TryCreate(issuer, UriKind.Absolute, out var u)
             || !string.IsNullOrEmpty(u.Query) || !string.IsNullOrEmpty(u.Fragment) || !string.IsNullOrEmpty(u.UserInfo)
             || u.AbsolutePath != "/")
             throw new AuthFIConfigurationException("The issuer must be an absolute URL such as https://acme.authfi.io, with no credentials, path or query.");
@@ -257,7 +257,7 @@ public sealed class AuthFIVerifier
             throw new AuthFIConfigurationException("The audience is the issuer or a URL under it, which gateway tokens carry." + fix);
         if (Uri.TryCreate(audience, UriKind.Absolute, out var au))
         {
-            var host = au.Host.ToLowerInvariant();
+            var host = au.Host.ToLowerInvariant().TrimEnd('.'); // "api.authfi.io." is the same host
             if (string.Equals(au.Host, new Uri(issuer).Host, StringComparison.OrdinalIgnoreCase)
                 || host == "authfi.io" || host.EndsWith(".authfi.io", StringComparison.Ordinal))
                 throw new AuthFIConfigurationException("The audience is on AuthFI's own domain, which gateway tokens carry." + fix);
@@ -648,10 +648,9 @@ internal sealed class KeyStore
             return byKid;
         }
         catch (AuthFIException) { throw; }
-        catch (Exception e) when (e is HttpRequestException or JsonException or InvalidOperationException or IOException
-                                      or NotSupportedException
-                                  || (e is TaskCanceledException && !ct.IsCancellationRequested))
+        catch (Exception e) when (!(e is OperationCanceledException && ct.IsCancellationRequested))
         {
+            // Whatever the transport raised (including a handler's own bug), the caller sees one refusal that names no input.
             throw new AuthFIException("jwks_unavailable", "The issuer's keys could not be fetched.", 503);
         }
     }
