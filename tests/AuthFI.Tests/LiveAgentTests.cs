@@ -27,6 +27,7 @@ public class LiveAgentTests
     });
 
     private static AgentAuth A() => Agent("AUTHFI_LIVE_AGENT_ID", "AUTHFI_LIVE_AGENT_KEY_FILE", "AUTHFI_LIVE_AGENT_KID");
+    private static AgentAuth C() => Agent("AUTHFI_LIVE_C_ID", "AUTHFI_LIVE_C_KEY_FILE", "AUTHFI_LIVE_C_KID");
     private static AgentAuth B() => Agent("AUTHFI_LIVE_B_ID", "AUTHFI_LIVE_B_KEY_FILE", "AUTHFI_LIVE_B_KID");
 
     private static AuthFIVerifier Verifier()
@@ -50,6 +51,55 @@ public class LiveAgentTests
         var b = await Verifier().VerifyAsync(await B().GetTokenAsync(Env("AUTHFI_LIVE_API_AUDIENCE")));
         _out.WriteLine($"MINTED by the SDK (PS256 key) and VERIFIED by the SDK: sub={b.Sub}");
         Assert.Equal(Env("AUTHFI_LIVE_B_ID"), b.Sub);
+    }
+
+    [LiveFact]
+    public async Task An_ES256_agent_mints_and_the_SDK_verifier_accepts_it()
+    {
+        var claims = await Verifier().VerifyAsync(await C().GetTokenAsync(Env("AUTHFI_LIVE_API_AUDIENCE")));
+        _out.WriteLine($"MINTED by the SDK (ES256 key) and VERIFIED by the SDK: sub={claims.Sub}");
+        Assert.Equal(Env("AUTHFI_LIVE_C_ID"), claims.Sub);
+    }
+
+    [LiveFact]
+    public async Task The_gateways_answer_to_a_tool_call_is_read_as_allowed_refused_or_held()
+    {
+        var agent = A();
+        var gateway = Env("AUTHFI_LIVE_ISSUER") + "/mcp";
+        using var http = new HttpClient(new AuthFIBearerHandler(agent, gateway));
+        async Task<JsonElement?> Rpc(string method, object? parameters)
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, gateway)
+            {
+                Content = JsonContent.Create(new { jsonrpc = "2.0", id = 1, method, @params = parameters ?? new { } }),
+            };
+            req.Headers.Accept.ParseAdd("application/json");
+            req.Headers.Accept.ParseAdd("text/event-stream");
+            using var res = await http.SendAsync(req);
+            var text = await res.Content.ReadAsStringAsync();
+            var json = text.TrimStart().StartsWith("{") ? text : string.Join("", text.Split((char)10).Where(l => l.StartsWith("data:")).Select(l => l[5..].Trim()));
+            _out.WriteLine($"{method}: HTTP {(int)res.StatusCode}");
+            if (json.Length == 0) return null;
+            var doc = JsonDocument.Parse(json).RootElement.Clone();
+            return doc.TryGetProperty("result", out var r) ? r : null;
+        }
+
+        var list = await Rpc("tools/list", null);
+        var tools = list is { } l && l.TryGetProperty("tools", out var t) ? t.EnumerateArray().Select(x => x.GetProperty("name").GetString()!).ToList() : new List<string>();
+        _out.WriteLine($"tools listed: {tools.Count}");
+        foreach (var name in tools.Take(3))
+        {
+            var result = await Rpc("tools/call", new { name, arguments = new { } });
+            if (result is null) continue;
+            var answer = GatewayAnswer.Read(result.Value);
+            _out.WriteLine($"GATEWAY ANSWER for a call to {name}: {answer.Kind} code={answer.Code} requiredScope={answer.RequiredScope}");
+            if (answer.Kind != GatewayAnswerKind.Allowed)
+            {
+                Assert.DoesNotContain(answer.ApprovalId ?? "~", answer.ModelText());
+                return;
+            }
+        }
+        _out.WriteLine("no refused or held answer was available to read on this project");
     }
 
     [LiveFact]
@@ -89,17 +139,21 @@ public class LiveAgentTests
         Assert.Contains(Env("AUTHFI_LIVE_LOGIN_HINT"), claims.Sub);
         Assert.Contains(Env("AUTHFI_LIVE_B_ID"), claims.Actor ?? "");
 
-        var person = new Secret(File.ReadAllText(Path.Combine(Env("AUTHFI_LIVE_DIR"), "user_api.tok")).Trim());
+        // Exchange needs a console-side delegation (an administrator grants the agent the right to act for this person).
+        // Without it the platform refuses, and the SDK reports a typed refusal; with it, the exchange returns a token for the person.
+        var owner = new Secret(File.ReadAllText(Path.Combine(Env("AUTHFI_LIVE_DIR"), "owner_api.tok")).Trim());
         try
         {
-            var t = await agent.ExchangeAsync(person, resource);
-            _out.WriteLine($"EXCHANGED: person={t.Person} agent={t.Agent}");
-            Assert.Equal(Env("AUTHFI_LIVE_B_ID"), t.Agent);
+            var exchanged = await agent.ExchangeAsync(owner, resource);
+            var exchangedClaims = await Verifier().VerifyAsync(exchanged.Token);
+            _out.WriteLine($"EXCHANGED and VERIFIED: person={exchanged.Person} agent={exchanged.Agent} sub={exchangedClaims.Sub}");
+            Assert.Equal(Env("AUTHFI_LIVE_B_ID"), exchanged.Agent);
         }
-        catch (AuthFIException e)
+        catch (AuthFIRefusedException e)
         {
-            _out.WriteLine($"EXCHANGE refused: {e.GetType().Name} code={e.Code} status={e.Status}");
-            Assert.DoesNotContain(person.Reveal(), e.ToString());
+            _out.WriteLine($"EXCHANGE refused without a delegation: {e.GetType().Name} code={e.Code} status={e.Status}");
+            Assert.Equal("access_denied", e.Code);
+            Assert.DoesNotContain(owner.Reveal(), e.ToString());
         }
     }
 
