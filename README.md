@@ -58,6 +58,45 @@ var auth = new AuthFIClient(options);
 leaves only through `Reveal()`. A verified `AuthFIClaims` keeps no raw token, and an `AuthFIException` never carries token content.
 `Verify` and `VerifyAsync` accept a `Secret` or a string.
 
+## Agents
+
+An AI agent has its own key and gets its own token; no secret is shared with the framework that runs it.
+
+```csharp
+using AuthFI.Agents;
+
+// Environment: AUTHFI_ISSUER, AUTHFI_AGENT_ID, AUTHFI_AGENT_KEY (PEM) or AUTHFI_AGENT_KEY_FILE, AUTHFI_AGENT_KEY_ID.
+var agent = AgentAuth.FromEnvironment();
+
+// The agent's own access token for an API it has been granted. Cached until a minute before it expires.
+Secret token = await agent.GetTokenAsync(resource: "api_orders");
+
+// Per-request credentials for an HttpClient (the gateway, an MCP transport): nothing holds the token.
+var http = new HttpClient(new AuthFIBearerHandler(agent));
+```
+
+A key file named by `AUTHFI_AGENT_KEY_FILE` must be closed to others (at most read for its owner's group). Keys are Ed25519, P-256 or RSA 2048 to 4096 bits: `AgentKey.Generate("EdDSA")`, `AgentKey.Load(pem)`, `key.PublicJwk()`.
+
+Acting for a person, with their consent on their own device (CIBA), or from a token they hold (RFC 8693):
+
+```csharp
+var ask = await agent.BackchannelAuthorizeAsync("ann@example.com", "Refund order 4411");
+DelegatedToken delegated = await agent.AwaitUserTokenAsync(ask);          // or poll yourself: agent.PollAsync(ask)
+DelegatedToken viaExchange = await agent.ExchangeAsync(personToken, resource: "api_orders");
+// delegated.Person, delegated.Agent, delegated.Token (a Secret)
+```
+
+Read the gateway's answer to a tool call one way:
+
+```csharp
+GatewayAnswer answer = GatewayAnswer.Read(callToolResultJson);
+// Allowed, Refused (Code, Reason, RequiredScope) or ApprovalRequired (ApprovalId, kept away from the model).
+// answer.ModelText() is what a model may read.
+```
+
+A 401 from the gateway throws `AuthFIAgentRevokedException` and a 403 `AuthFIRefusedException`, so an app can tell a revoked agent from a bug.
+Tokens, keys and approval handles are `Secret` values and never appear in `ToString`, JSON or exception text.
+
 ## Permission and role checks
 
 ```csharp

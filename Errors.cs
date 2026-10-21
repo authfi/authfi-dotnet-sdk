@@ -26,3 +26,15 @@ public sealed class AuthFIConfigurationException : ArgumentException
 {
     public AuthFIConfigurationException(string message) : base(message) { }
 }
+
+/// <summary>The gateway or token endpoint no longer accepts this agent's credential (401): the agent was revoked or its key retired.</summary>
+public sealed class AuthFIAgentRevokedException : AuthFIException
+{
+    public AuthFIAgentRevokedException(string message) : base("agent_revoked", message, 401) { }
+}
+
+/// <summary>The platform refused the agent this call (403). <see cref="AuthFIException.Code"/> carries its reason when it gave one.</summary>
+public sealed class AuthFIRefusedException : AuthFIException
+{
+    public AuthFIRefusedException(string code, string message) : base(code, message, 403) { }
+}
