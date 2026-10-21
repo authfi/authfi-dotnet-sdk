@@ -75,7 +75,7 @@ Secret token = await agent.GetTokenAsync(resource: "api_orders");
 var http = new HttpClient(new AuthFIBearerHandler(agent));
 ```
 
-Keys are Ed25519, P-256 or RSA 2048 to 4096 bits: `AgentKey.Generate("EdDSA")`, `AgentKey.Load(pem)`, `key.PublicJwk()`.
+A key file named by `AUTHFI_AGENT_KEY_FILE` must be closed to others (at most read for its owner's group). Keys are Ed25519, P-256 or RSA 2048 to 4096 bits: `AgentKey.Generate("EdDSA")`, `AgentKey.Load(pem)`, `key.PublicJwk()`.
 
 Acting for a person, with their consent on their own device (CIBA), or from a token they hold (RFC 8693):
 

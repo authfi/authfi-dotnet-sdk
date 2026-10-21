@@ -52,13 +52,13 @@ public sealed class GatewayAnswer
         _ => toolText,
     };
 
-    // Free text from a refusal is data a tool may have chosen: one short line, no control characters.
+    // A refusal's free text can come from a tool behind the gateway, so a model reads only the code and the scope,
+    // each limited to its alphabet. <see cref="Reason"/> is for the application's own log, not for a model.
     private string RefusedText()
     {
         var code = Plain(Code ?? Error, 64, "[a-z0-9_.:-]+") ?? "refused";
-        var reason = Plain(Reason, 160, null);
         var scope = Plain(RequiredScope, 100, "[A-Za-z0-9_.:/*@-]+");
-        var text = $"Refused by AuthFI ({code})" + (reason is null ? "" : ": " + reason) + ".";
+        var text = $"Refused by AuthFI ({code}).";
         return scope is null ? text : text + $" The call needs the scope {scope}.";
     }
 
@@ -197,6 +197,21 @@ public sealed class AuthFIBearerHandler : DelegatingHandler
         _resource = resource;
     }
 
+    // The error code of a refusal body when it is one short token; anything else (a proxy page) is just "forbidden".
+    private static async Task<string> RefusalCodeAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        try
+        {
+            if (response.Content.Headers.ContentLength > 4096) return "forbidden";
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false));
+            if (doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("error", out var e)
+                && e.ValueKind == JsonValueKind.String && e.GetString() is { } code && Regex.IsMatch(code, @"^[a-z0-9_.:-]{1,64}\z"))
+                return code;
+        }
+        catch (Exception ex) when (ex is JsonException or HttpRequestException or InvalidOperationException) { }
+        return "forbidden";
+    }
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
         var token = await _auth.GetTokenAsync(_resource, ct).ConfigureAwait(false);
@@ -212,11 +227,12 @@ public sealed class AuthFIBearerHandler : DelegatingHandler
         {
             case 401:
                 response.Dispose();
-                await _auth.ForgetTokenAsync(_resource, CancellationToken.None).ConfigureAwait(false); // the next request mints afresh
-                throw new AuthFIAgentRevokedException("The gateway no longer accepts this agent's credential (401): the agent was revoked or its key retired.");
+                await _auth.ForgetTokenAsync(_resource, token, CancellationToken.None).ConfigureAwait(false); // the next request mints afresh
+                throw new AuthFIAgentRevokedException("The gateway no longer accepts this agent's credential (401). The agent may have been revoked, or its key or clock is wrong.");
             case 403:
+                var code = await RefusalCodeAsync(response, ct).ConfigureAwait(false);
                 response.Dispose();
-                throw new AuthFIRefusedException("forbidden", "The gateway refused this agent the call (403).");
+                throw new AuthFIRefusedException(code, $"The gateway refused this agent the call (403, {code}).");
         }
         return response;
     }

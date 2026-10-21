@@ -113,10 +113,11 @@ public sealed class AgentAuth
         {
             var file = Environment.GetEnvironmentVariable("AUTHFI_AGENT_KEY_FILE");
             if (string.IsNullOrEmpty(file)) throw new AuthFIConfigurationException("Set AUTHFI_AGENT_KEY or AUTHFI_AGENT_KEY_FILE.");
+            if (!File.Exists(file)) throw new AuthFIConfigurationException("AUTHFI_AGENT_KEY_FILE names no file.");
             if (!OperatingSystem.IsWindows()
-                && (File.GetUnixFileMode(file) & (UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+                && (File.GetUnixFileMode(file) & (UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
                                                   | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute)) != 0)
-                throw new AuthFIConfigurationException("The agent key file is readable by others; restrict it to its owner (chmod 600).");
+                throw new AuthFIConfigurationException("The agent key file is open to others; allow at most read for its owner's group (chmod 600 or 640).");
             pem = File.ReadAllText(file);
         }
         return new AgentAuth(new AgentAuthOptions
@@ -162,10 +163,15 @@ public sealed class AgentAuth
     }
 
     /// <summary>Drops the cached token for <paramref name="resource"/>, so the next call mints a fresh one. The gateway calls this when it refuses a token.</summary>
-    public async Task ForgetTokenAsync(string? resource = null, CancellationToken ct = default)
+    public async Task ForgetTokenAsync(string? resource = null, Secret? refused = null, CancellationToken ct = default)
     {
         await _mint.WaitAsync(ct).ConfigureAwait(false);
-        try { _cache.Remove(resource ?? ""); }
+        try
+        {
+            // A late refusal of an old token must not evict a newer one minted meanwhile.
+            if (_cache.TryGetValue(resource ?? "", out var hit) && (refused is null || hit.Token.ValueEquals(refused)))
+                _cache.Remove(resource ?? "");
+        }
         finally { _mint.Release(); }
     }
 
@@ -196,21 +202,24 @@ public sealed class AgentAuth
         var lifetime = Num(root, "expires_in") is > 0 and var e ? e : 300;
         var approvalUrl = Str(root, "approval_url");
         return new CibaRequest(new Secret(id), now.AddSeconds(lifetime), interval, now + interval,
-            approvalUrl is not null && OnIssuerOrigin(approvalUrl) ? approvalUrl : null);
+            approvalUrl is not null && OnIssuerOrigin(approvalUrl) ? new Uri(approvalUrl).AbsoluteUri : null);
     }
 
     /// <summary>
     /// One non-blocking poll. Returns null while the person has not decided, and sends nothing before
     /// <see cref="CibaRequest.NextPollAt"/>. <c>slow_down</c> widens the interval by five seconds.
     /// </summary>
-    public async Task<DelegatedToken?> PollAsync(CibaRequest request, string? resource = null, CancellationToken ct = default)
+    public async Task<DelegatedToken?> PollAsync(CibaRequest request, string? resource = null, CancellationToken ct = default) =>
+        (await PollCoreAsync(request, resource, ct).ConfigureAwait(false)).Token;
+
+    private async Task<(DelegatedToken? Token, bool Busy)> PollCoreAsync(CibaRequest request, string? resource, CancellationToken ct)
     {
-        if (!await request.PollGate.WaitAsync(0, ct).ConfigureAwait(false)) return null; // a poll for this request is already on its way
+        if (!await request.PollGate.WaitAsync(0, ct).ConfigureAwait(false)) return (null, true); // a poll for this request is already on its way
         try
         {
             var now = _time.GetUtcNow();
             if (now >= request.ExpiresAt) throw new AuthFIException("expired_token", "The person did not decide before the request expired.", 400);
-            if (now < request.NextPollAt) return null;
+            if (now < request.NextPollAt) return (null, false);
             var meta = await MetaAsync(ct).ConfigureAwait(false);
             var form = ClientAuth(meta.TokenEndpoint);
             form["grant_type"] = CibaGrant;
@@ -219,18 +228,18 @@ public sealed class AgentAuth
             try
             {
                 using var body = await PostFormAsync(meta.TokenEndpoint, () => form, retryOnReset: false, ct).ConfigureAwait(false);
-                return Delegated(body);
+                return (Delegated(body), false);
             }
             catch (AuthFIException e) when (e.Code == "authorization_pending")
             {
                 request.NextPollAt = _time.GetUtcNow() + request.Interval;
-                return null;
+                return (null, false);
             }
             catch (AuthFIException e) when (e.Code == "slow_down")
             {
                 request.Interval += SlowDownStep;
                 request.NextPollAt = _time.GetUtcNow() + request.Interval;
-                return null;
+                return (null, false);
             }
         }
         finally { request.PollGate.Release(); }
@@ -244,12 +253,14 @@ public sealed class AgentAuth
         while (true)
         {
             var wait = request.NextPollAt - _time.GetUtcNow();
-            if (_time.GetUtcNow() + (wait > TimeSpan.Zero ? wait : TimeSpan.Zero) > deadline)
+            if (wait < TimeSpan.Zero) wait = TimeSpan.Zero;
+            if (_time.GetUtcNow() + wait > deadline)
                 throw new AuthFIException("authorization_pending",
                     "The person had not decided in time; the request may still be open.", 408);
             if (wait > TimeSpan.Zero) await _delay(wait, ct).ConfigureAwait(false);
-            var token = await PollAsync(request, resource, ct).ConfigureAwait(false);
+            var (token, busy) = await PollCoreAsync(request, resource, ct).ConfigureAwait(false);
             if (token is not null) return token;
+            if (busy) await _delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false); // another caller's poll is in flight; do not spin
         }
     }
 
@@ -291,12 +302,12 @@ public sealed class AgentAuth
         {
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             req.Headers.Authorization = new("Bearer", token.Reveal());
-            using var res = await _http.SendAsync(req, ct).ConfigureAwait(false);
+            using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             text = await ReadBoundedAsync(res, ct).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode) throw Failure((int)res.StatusCode, text);
         }
         catch (HttpRequestException) { throw new AuthFIException("connection_failed", "The request to the issuer failed.", 502); }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested) { throw new AuthFIException("timeout", "The issuer did not answer in time.", 504); }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new AuthFIException("timeout", "The issuer did not answer in time.", 504); }
         using var doc = Parse(text);
         var data = doc.RootElement.TryGetProperty("data", out var d) && d.ValueKind == JsonValueKind.Object ? d : doc.RootElement;
         var id = Str(data, "approval_id") ?? Str(data, "id") ?? approvalId;
@@ -353,13 +364,13 @@ public sealed class AgentAuth
     {
         try
         {
-            using var res = await _http.GetAsync(url, ct).ConfigureAwait(false);
+            using var res = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode)
                 throw new AuthFIException("metadata_invalid", $"The issuer answered {(int)res.StatusCode} for its discovery document.", 502);
             return await ReadBoundedAsync(res, ct).ConfigureAwait(false);
         }
         catch (HttpRequestException) { throw new AuthFIException("metadata_invalid", "The issuer's discovery document could not be fetched.", 502); }
-        catch (TaskCanceledException) when (!ct.IsCancellationRequested) { throw new AuthFIException("timeout", "The issuer did not answer in time.", 504); }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new AuthFIException("timeout", "The issuer did not answer in time.", 504); }
     }
 
     private async Task<JsonDocument> PostFormAsync(string url, Func<Dictionary<string, string>> form, bool retryOnReset, CancellationToken ct)
@@ -370,7 +381,7 @@ public sealed class AgentAuth
             {
                 using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = new FormUrlEncodedContent(form()) };
                 req.Headers.Accept.ParseAdd("application/json");
-                using var res = await _http.SendAsync(req, ct).ConfigureAwait(false);
+                using var res = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
                 var text = await ReadBoundedAsync(res, ct).ConfigureAwait(false);
                 if (!res.IsSuccessStatusCode) throw Failure((int)res.StatusCode, text);
                 return Parse(text);
@@ -383,19 +394,22 @@ public sealed class AgentAuth
             {
                 throw new AuthFIException("connection_failed", "The request to the issuer failed.", 502);
             }
-            catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
                 throw new AuthFIException("timeout", "The issuer did not answer in time.", 504);
             }
         }
     }
 
-    private static async Task<string> ReadBoundedAsync(HttpResponseMessage res, CancellationToken ct)
+    // With ResponseHeadersRead the client's own timeout stops at the headers, so the body gets the same budget here.
+    private async Task<string> ReadBoundedAsync(HttpResponseMessage res, CancellationToken ct)
     {
         const int limit = 1 << 20;
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        budget.CancelAfter(_http.Timeout);
         if (res.Content.Headers.ContentLength > limit) throw new HttpRequestException("answer too large");
-        await res.Content.LoadIntoBufferAsync(limit).WaitAsync(ct).ConfigureAwait(false); // a streamed answer fails here as a transport error
-        var text = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        await res.Content.LoadIntoBufferAsync(limit).WaitAsync(budget.Token).ConfigureAwait(false); // a streamed answer fails here as a transport error
+        var text = await res.Content.ReadAsStringAsync(budget.Token).ConfigureAwait(false);
         if (text.Length > limit) throw new HttpRequestException("answer too large"); // an already-buffered one is checked here
         return text;
     }
@@ -454,7 +468,8 @@ public sealed class AgentAuth
         if (agent != _agentId)
             throw new AuthFIException("invalid_response", "The delegated token names another agent.", 502);
         var expires = _time.GetUtcNow().AddSeconds(expiresIn);
-        if (claims.RootElement.TryGetProperty("exp", out var exp) && exp.ValueKind == JsonValueKind.Number && exp.TryGetInt64(out var e))
+        if (claims.RootElement.TryGetProperty("exp", out var exp) && exp.ValueKind == JsonValueKind.Number && exp.TryGetInt64(out var e)
+            && e > 0 && e < 253402300799)
             expires = DateTimeOffset.FromUnixTimeSeconds(e);
         var scope = (Str(body.RootElement, "scope") ?? Str(claims.RootElement, "scope") ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
         return new DelegatedToken(token, expires, person, agent, scope);

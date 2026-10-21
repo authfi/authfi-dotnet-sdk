@@ -175,7 +175,7 @@ public class AgentHardeningTests
         try
         {
             File.WriteAllText(path, key.ExportPrivatePem().Reveal());
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.OtherRead);
             Environment.SetEnvironmentVariable("AUTHFI_ISSUER", AgentIssuer.Issuer);
             Environment.SetEnvironmentVariable("AUTHFI_AGENT_ID", AgentIssuer.AgentId);
             Environment.SetEnvironmentVariable("AUTHFI_AGENT_KEY", null);
