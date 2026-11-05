@@ -11,6 +11,13 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <RepositoryUrl>https://github.com/authfi/authfi-dotnet-sdk</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>authfi;oauth;oidc;jwt;access-token;ai-agents</PackageTags>
+    <PackageReleaseNotes>https://github.com/authfi/authfi-dotnet-sdk/blob/main/CHANGELOG.md</PackageReleaseNotes>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
