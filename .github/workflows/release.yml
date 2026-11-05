@@ -35,7 +35,7 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$TAG is not on main"; exit 1; }
           v="${TAG#v}"
           [ "$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' AuthFI.csproj)" = "$v" ] || { echo "::error::AuthFI.csproj version is not $v"; exit 1; }
-          grep -Eq "^## \[?${v//./\.}\]?( |$)" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $v"; exit 1; }
+          grep -Eq "^## \[?${v//./\\.}\]?( |$)" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $v"; exit 1; }
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: '8.0.x'
